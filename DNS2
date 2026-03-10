@@ -1,0 +1,411 @@
+#!/bin/bash
+
+clear
+echo "Cloudflare DNS Manager"
+echo "======================"
+echo
+
+install_packages(){
+
+if ! command -v curl &> /dev/null; then
+    echo "Installing curl..."
+    apt-get update -y >/dev/null 2>&1
+    apt-get install curl -y >/dev/null 2>&1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "Installing jq..."
+    apt-get install jq -y >/dev/null 2>&1
+fi
+
+}
+
+install_packages
+
+API="https://api.cloudflare.com/client/v4"
+
+prompt_back_to_menu(){
+
+echo
+read -p "Do you want to go back to menu? (y/n): " back
+
+if [[ "$back" == "y" ]]; then
+    main_menu
+else
+    echo "Exiting..."
+    exit
+fi
+
+}
+
+retry_or_menu(){
+
+func="$1"
+
+echo
+read -p "Do you want to try again? (y/n): " choice
+
+if [[ "$choice" == "y" ]]; then
+    $func
+else
+    prompt_back_to_menu
+fi
+
+}
+
+validate_input(){
+
+input="$1"
+func="$2"
+
+if [[ -z "$input" ]]; then
+    echo
+    echo "Input cannot be empty!"
+    retry_or_menu "$func"
+fi
+
+}
+
+validate_ipv4(){
+
+ip="$1"
+func="$2"
+
+if ! [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo
+    echo "Invalid IPv4 address!"
+    retry_or_menu "$func"
+fi
+
+IFS='.' read -r a b c d <<< "$ip"
+
+for oct in $a $b $c $d; do
+    if ((oct < 0 || oct > 255)); then
+        echo
+        echo "Invalid IPv4 address!"
+        retry_or_menu "$func"
+    fi
+done
+
+}
+
+email_prompt(){
+
+read -p "Enter Cloudflare Email: " CF_EMAIL
+
+if [[ -z "$CF_EMAIL" ]]; then
+    echo
+    echo "Input cannot be empty!"
+    email_prompt
+fi
+
+}
+
+key_prompt(){
+
+read -p "Enter Cloudflare Global API Key: " CF_KEY
+
+if [[ -z "$CF_KEY" ]]; then
+    echo
+    echo "Input cannot be empty!"
+    key_prompt
+fi
+
+}
+
+email_prompt
+key_prompt
+
+get_domains(){
+
+DOMAINS=()
+ZONES=()
+
+response=$(curl -s -X GET "$API/zones?per_page=100" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json")
+
+count=$(echo "$response" | jq '.result | length')
+
+if [[ "$count" -eq 0 ]]; then
+    echo "No domains found or invalid credentials!"
+    prompt_back_to_menu
+fi
+
+echo
+echo "$count Domains found."
+echo
+
+for i in $(seq 0 $(($count-1))); do
+
+name=$(echo "$response" | jq -r ".result[$i].name")
+zone=$(echo "$response" | jq -r ".result[$i].id")
+
+DOMAINS+=("$name")
+ZONES+=("$zone")
+
+echo "$((i+1)). $name"
+
+done
+
+}
+
+create_dns(){
+
+echo
+read -p "Enter desired name (example: dns): " NAME
+validate_input "$NAME" "create_dns"
+
+echo
+read -p "Enter IPs (format 1.1.1.1/2.2.2.2/3.3.3.3): " IP_INPUT
+validate_input "$IP_INPUT" "create_dns"
+
+IFS='/' read -ra IPS <<< "$IP_INPUT"
+
+COUNT=${#IPS[@]}
+
+if [[ "$COUNT" -gt 100 ]]; then
+    echo
+    echo "Maximum 100 IPs allowed!"
+    retry_or_menu "create_dns"
+fi
+
+for ip in "${IPS[@]}"; do
+    validate_ipv4 "$ip" "create_dns"
+done
+
+echo
+echo "Select Proxy Status:"
+echo "1. DNS Only"
+echo "2. Proxied"
+
+read -p "Enter number: " proxy
+validate_input "$proxy" "create_dns"
+
+if [[ "$proxy" == "1" ]]; then
+    PROXY=false
+elif [[ "$proxy" == "2" ]]; then
+    PROXY=true
+else
+    echo "Invalid option!"
+    retry_or_menu "create_dns"
+fi
+
+echo
+echo "Creating DNS records..."
+echo
+
+for i in "${!ZONES[@]}"; do
+
+domain="${DOMAINS[$i]}"
+zone="${ZONES[$i]}"
+
+line="$domain"
+
+index=1
+
+for ip in "${IPS[@]}"; do
+
+dnsname="${NAME}${index}.${domain}"
+
+curl -s -X POST "$API/zones/$zone/dns_records" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" \
+--data "{\"type\":\"A\",\"name\":\"$dnsname\",\"content\":\"$ip\",\"ttl\":120,\"proxied\":$PROXY}" > /dev/null
+
+line="$line $dnsname -> $ip"
+
+if [[ "$index" -lt "$COUNT" ]]; then
+line="$line /"
+fi
+
+((index++))
+
+done
+
+echo "$line"
+
+done
+
+echo
+echo "DNS records created successfully!"
+prompt_back_to_menu
+
+}
+
+update_dns(){
+
+echo
+read -p "Enter full DNS record to update (example: dns1.domain.com): " RECORD
+validate_input "$RECORD" "update_dns"
+
+read -p "Enter desired IP: " IP
+validate_input "$IP" "update_dns"
+validate_ipv4 "$IP" "update_dns"
+
+echo
+echo "Select Proxy Status:"
+echo "1. DNS Only"
+echo "2. Proxied"
+
+read -p "Enter number: " proxy
+validate_input "$proxy" "update_dns"
+
+if [[ "$proxy" == "1" ]]; then
+    PROXY=false
+elif [[ "$proxy" == "2" ]]; then
+    PROXY=true
+else
+    echo "Invalid option!"
+    retry_or_menu "update_dns"
+fi
+
+FOUND=0
+
+for i in "${!ZONES[@]}"; do
+
+zone="${ZONES[$i]}"
+
+rid=$(curl -s -X GET "$API/zones/$zone/dns_records?name=$RECORD" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" | jq -r '.result[0].id')
+
+if [[ "$rid" != "null" ]]; then
+
+curl -s -X PUT "$API/zones/$zone/dns_records/$rid" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" \
+--data "{\"type\":\"A\",\"name\":\"$RECORD\",\"content\":\"$IP\",\"ttl\":120,\"proxied\":$PROXY}" > /dev/null
+
+echo "Updated $RECORD"
+
+FOUND=1
+break
+
+fi
+
+done
+
+if [[ $FOUND -eq 0 ]]; then
+echo "DNS record not found!"
+retry_or_menu "update_dns"
+fi
+
+echo
+echo "DNS updated successfully!"
+prompt_back_to_menu
+
+}
+
+delete_dns(){
+
+echo
+read -p "Enter full DNS record to delete: " RECORD
+validate_input "$RECORD" "delete_dns"
+
+FOUND=0
+
+for i in "${!ZONES[@]}"; do
+
+zone="${ZONES[$i]}"
+
+rid=$(curl -s -X GET "$API/zones/$zone/dns_records?name=$RECORD" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" | jq -r '.result[0].id')
+
+if [[ "$rid" != "null" ]]; then
+
+curl -s -X DELETE "$API/zones/$zone/dns_records/$rid" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" > /dev/null
+
+echo "Deleted $RECORD"
+
+FOUND=1
+break
+
+fi
+
+done
+
+if [[ $FOUND -eq 0 ]]; then
+echo "DNS record not found!"
+retry_or_menu "delete_dns"
+fi
+
+echo
+echo "DNS deleted successfully!"
+prompt_back_to_menu
+
+}
+
+delete_all_dns(){
+
+echo
+get_domains
+
+echo
+read -p "Select number of your choice: " num
+validate_input "$num" "delete_all_dns"
+
+if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -le 0 ] || [ "$num" -gt "${#DOMAINS[@]}" ]; then
+    echo "Invalid number!"
+    retry_or_menu "delete_all_dns"
+fi
+
+zone="${ZONES[$((num-1))]}"
+domain="${DOMAINS[$((num-1))]}"
+
+echo
+echo "Completely wiping DNS for $domain..."
+
+curl -s -X DELETE "$API/zones/$zone" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" > /dev/null
+
+sleep 2
+
+curl -s -X POST "$API/zones" \
+-H "X-Auth-Email: $CF_EMAIL" \
+-H "X-Auth-Key: $CF_KEY" \
+-H "Content-Type: application/json" \
+--data "{\"name\":\"$domain\",\"jump_start\":false}" > /dev/null
+
+echo
+echo "$domain DNS records have been COMPLETELY wiped!"
+prompt_back_to_menu
+
+}
+
+main_menu(){
+
+echo
+echo "=========== MENU ==========="
+echo "1. Create DNS"
+echo "2. Update DNS"
+echo "3. Delete DNS"
+echo "4. Delete ALL DNS"
+echo
+
+read -p "Select number: " choice
+validate_input "$choice" "main_menu"
+
+case $choice in
+1) create_dns ;;
+2) update_dns ;;
+3) delete_dns ;;
+4) delete_all_dns ;;
+*) echo "Invalid option"; retry_or_menu "main_menu" ;;
+esac
+
+}
+
+get_domains
+main_menu
